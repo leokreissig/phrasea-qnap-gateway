@@ -49,7 +49,11 @@ class JwksValidator:
         if monotonic() >= self._expires_at or key_id not in self._keys:
             response = httpx.get(self.settings.jwks_url, timeout=5.0)
             response.raise_for_status()
-            self._keys = {item["kid"]: jwt.PyJWK.from_dict(item) for item in response.json()["keys"] if "kid" in item}
+            self._keys = {
+                item["kid"]: jwt.PyJWK.from_dict(item)
+                for item in response.json()["keys"]
+                if item.get("kid") and item.get("use") == "sig"
+            }
             self._expires_at = monotonic() + self.settings.cache_ttl_seconds
         if key_id not in self._keys:
             raise HTTPException(status.HTTP_401_UNAUTHORIZED, "unknown signing key")
