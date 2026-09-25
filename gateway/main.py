@@ -4,6 +4,7 @@ import os
 from contextlib import asynccontextmanager
 from math import isfinite
 from typing import Annotated
+from urllib.parse import quote
 
 from fastapi import Depends, FastAPI, HTTPException, status
 from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
@@ -18,7 +19,7 @@ bearer_scheme = HTTPBearer(auto_error=True)
 def create_app(repository: EntryRepository | None = None, validator: JwksValidator | None = None) -> FastAPI:
     """Create the synchronization gateway application."""
     if repository is None:
-        repository = PostgresEntryRepository(_required_setting("DATABASE_URL"))
+        repository = PostgresEntryRepository(database_url())
     if validator is None:
         validator = JwksValidator(JwtSettings(
             issuer=_required_setting("OIDC_ISSUER"),
@@ -80,6 +81,20 @@ def create_app(repository: EntryRepository | None = None, validator: JwksValidat
 def create_production_app() -> FastAPI:
     """Create the configured application for the production ASGI server."""
     return create_app()
+
+
+def database_url() -> str:
+    """Return an explicit database URL or construct one from injected DB settings."""
+    if value := os.getenv("DATABASE_URL"):
+        return value
+
+    return "postgresql://{user}:{password}@{host}:{port}/{database}".format(
+        user=quote(_required_setting("DB_USER"), safe=""),
+        password=quote(_required_setting("DB_PASSWORD"), safe=""),
+        host=_required_setting("DB_HOST"),
+        port=os.getenv("DB_PORT", "5432"),
+        database=_required_setting("DB_NAME"),
+    )
 
 
 def _required_setting(name: str) -> str:
