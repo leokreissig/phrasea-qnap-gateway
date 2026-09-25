@@ -1,45 +1,78 @@
-"""Unit tests for synchronization metadata behavior."""
+"""Tests for source-independent family reconciliation decisions."""
 
 from uuid import uuid4
 
 from fastapi.testclient import TestClient
 
 from gateway.main import create_app
-from gateway.repository import InMemoryEntryRepository
+from gateway.repository import InMemoryFamilyRepository
 
 
 class AllowAllValidator:
-    """Test-only validator that accepts any bearer credential."""
+    """Test-only validator that accepts every syntactically valid bearer header."""
 
     def validate(self, _credentials):
-        """Return a fixed set of gateway claims for tests."""
+        """Return fixed gateway claims for unit tests."""
         return {"azp": "phrasea-sync-gateway", "roles": ["sync-gateway-access"]}
 
 
-def make_client() -> TestClient:
-    """Build a gateway client with in-memory storage and token validation."""
-    return TestClient(create_app(repository=InMemoryEntryRepository(), validator=AllowAllValidator()))
+def client() -> TestClient:
+    """Create a test client with in-memory identity persistence."""
+    return TestClient(create_app(repository=InMemoryFamilyRepository(), validator=AllowAllValidator()))
 
 
 def headers() -> dict[str, str]:
-    """Return a syntactically valid bearer header for the test validator."""
+    """Return a test authorization header."""
     return {"Authorization": "Bearer test-token"}
 
 
-def test_entry_lifecycle() -> None:
-    """Persist, compare, retrieve, and remove a synchronization entry."""
-    client = make_client()
+def family(source: str, path: str, sha256: str, document_id: str | None = None) -> dict:
+    """Return a complete RAW/JPEG/XMP family description for tests."""
+    return {
+        "source": source,
+        "family_path": path,
+        "document_id": document_id,
+        "metadata_fingerprint": "b" * 64,
+        "files": [
+            {"path": path + ".dng", "role": "main", "size": 100, "mtime": 10, "sha256": sha256},
+            {"path": path + ".jpg", "role": "jpeg", "size": 10, "mtime": 10, "sha256": "c" * 64},
+            {"path": path + ".xmp", "role": "xmp", "size": 1, "mtime": 10, "sha256": "d" * 64},
+        ],
+    }
+
+
+def test_first_source_receives_full_family_plan() -> None:
+    """A new family gets one ordered plan instead of separate client logic."""
+    response = client().post("/v1/check", json=family("storagebox", "2012/IMG_0001", "a" * 64), headers=headers())
+    assert [item["action"] for item in response.json()["operations"]] == ["upload-main", "upload-rendition", "update-metadata"]
+
+
+def test_second_source_is_recognized_by_hash() -> None:
+    """NAS and Storage Box copies converge on one Databox asset by content hash."""
+    api = client()
+    original = family("storagebox", "2012/IMG_0001", "a" * 64, "xmp.did:abc")
     asset_id = str(uuid4())
-    payload = {"path": "2026/RAW/image.dng", "asset_id": asset_id, "size": 42, "mtime": 123.5}
-    assert client.post("/v1/check", json={"path": payload["path"], "size": 42, "mtime": 123.5}, headers=headers()).json() == {"unchanged": False, "asset_id": None}
-    assert client.put("/v1/entries", json=payload, headers=headers()).status_code == 204
-    assert client.post("/v1/check", json={"path": payload["path"], "size": 42, "mtime": 123.5}, headers=headers()).json() == {"unchanged": True, "asset_id": asset_id}
-    assert client.get("/v1/entries", params={"path": payload["path"]}, headers=headers()).status_code == 200
-    assert client.delete("/v1/entries", params={"path": payload["path"]}, headers=headers()).status_code == 200
-    assert client.get("/v1/entries", params={"path": payload["path"]}, headers=headers()).status_code == 404
+    assert api.put("/v1/entries", json={**original, "asset_id": asset_id}, headers=headers()).status_code == 200
+
+    second = family("nas", "2012/moved/IMG_0001", "a" * 64, "xmp.did:abc")
+    response = api.post("/v1/check", json=second, headers=headers()).json()
+    assert response["asset_id"] == asset_id
+    assert response["operations"][0]["action"] == "record-alias"
 
 
-def test_rejects_parent_paths() -> None:
-    """Reject paths that could escape the synchronized archive root."""
-    response = make_client().post("/v1/check", json={"path": "../outside", "size": 1, "mtime": 1}, headers=headers())
+def test_changed_xmp_requests_metadata_update() -> None:
+    """A known image with changed XMP does not trigger a main reupload."""
+    api = client()
+    original = family("storagebox", "2012/IMG_0001", "a" * 64)
+    asset_id = str(uuid4())
+    api.put("/v1/entries", json={**original, "asset_id": asset_id}, headers=headers())
+    changed = family("nas", "2012/IMG_0001", "a" * 64)
+    changed["metadata_fingerprint"] = "e" * 64
+    actions = [item["action"] for item in api.post("/v1/check", json=changed, headers=headers()).json()["operations"]]
+    assert actions == ["record-alias", "update-metadata", "upload-rendition"]
+
+
+def test_rejects_incomplete_family() -> None:
+    """Reject a request that would make identity decisions without a main file."""
+    response = client().post("/v1/check", json={"source": "nas", "family_path": "bad", "files": [{"path": "bad.xmp", "role": "xmp", "size": 1, "mtime": 1, "sha256": "a" * 64}]}, headers=headers())
     assert response.status_code == 422
