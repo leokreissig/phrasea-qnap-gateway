@@ -167,7 +167,10 @@ class PostgresFamilyRepository:
     @staticmethod
     def _from_row(row: dict | None) -> CanonicalAsset | None:
         """Convert a database row into an immutable canonical identity."""
-        return CanonicalAsset(**row) if row else None
+        if row is None:
+            return None
+        row.pop("updated_at", None)
+        return CanonicalAsset(**row)
 
 
 class InMemoryFamilyRepository:
